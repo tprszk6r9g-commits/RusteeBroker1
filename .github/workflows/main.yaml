@@ -1,0 +1,222 @@
+name: Deploy Rustee Portfolio Terminal v2.8.5 Hardened
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
+
+concurrency:
+  group: rustee-portfolio-terminal-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Verify hardened terminal
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s index.html
+          grep -q "Portfolio Terminal v2.8.5" index.html
+          grep -q "Content-Security-Policy" index.html
+          grep -q "secureSendTransaction" index.html
+          grep -q "waitForInjectedWallet" index.html
+          grep -q "eip6963:announceProvider" index.html
+          grep -q "eip6963:requestProvider" index.html
+          grep -q "io.rabby" index.html
+          grep -q "commandConnect" index.html
+          grep -q "restoreWalletConnection" index.html
+          grep -q "withTimeout" index.html
+          grep -q "commandRefreshPromise" index.html
+          grep -q "optionalSecurityDigest" index.html
+          grep -q "wallet signature request" index.html
+          grep -q "hardenedTxPreflight" index.html
+          grep -q "verifyPublishedIntegrity" index.html
+          grep -q "MAX_AMOUNT_IN_WEI" index.html
+          grep -q "SELL_REVOKE" index.html
+          grep -q "Evidence &amp; Signed-Report Replay Console" index.html
+          ! grep -Eiq '<script[^>]+src=' index.html
+          ! grep -Eiq ' on(click|error|load|mouseover|focus)=' index.html
+          ! grep -Eiq '\beval\s*\(|new Function\s*\(' index.html
+          echo "PASS: static frontend security checks"
+
+      - name: Build same-origin public snapshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data
+
+          python3 <<'PY'
+          import json, urllib.request, urllib.parse, pathlib, datetime
+          import concurrent.futures, time, re
+
+          ASSETS_URL="https://api.robinhood.com/rhj/assets"
+          PRICE_BASE="https://api.robinhood.com/rhj/prices/"
+          BLOCKSCOUT_BASE="https://robinhoodchain.blockscout.com"
+          BS=BLOCKSCOUT_BASE+"/api/v2/addresses/{}/token-transfers?type=ERC-20"
+          ADDRS=[
+            "0x8fC320c8582f812695b6f62b2b5d13B14475B955",
+            "0x8ad8bd35d33dd7b4d0de81f809f5b7f92623956d",
+            "0x522f5637f2c556aad9b2245f3b8e6bf4dfd9a654",
+            "0xfd0d881d73ec1476f5da0ab78283149ea21c3b32",
+            "0x496d7d47ae69d65d714413f0dc78c712ed92158d",
+          ]
+          now=datetime.datetime.now(datetime.timezone.utc).isoformat()
+          address_re=re.compile(r"^0x[0-9a-fA-F]{40}$")
+
+          def get(url,timeout=20,max_bytes=8_000_000):
+              parsed=urllib.parse.urlparse(url)
+              allowed={
+                "api.robinhood.com",
+                "robinhoodchain.blockscout.com",
+              }
+              if parsed.scheme!="https" or parsed.hostname not in allowed:
+                  raise RuntimeError("refusing unexpected snapshot host: "+str(parsed.hostname))
+              req=urllib.request.Request(url,headers={
+                  "Accept":"application/json",
+                  "User-Agent":"Rustee-Portfolio-Terminal-v2.8.5"
+              })
+              last=None
+              for i in range(3):
+                  try:
+                      with urllib.request.urlopen(req,timeout=timeout) as r:
+                          raw=r.read(max_bytes+1)
+                          if len(raw)>max_bytes:
+                              raise RuntimeError("snapshot response exceeded byte ceiling")
+                          return json.loads(raw.decode("utf-8"))
+                  except Exception as e:
+                      last=e
+                      if i<2: time.sleep(i+1)
+              raise last
+
+          assets=get(ASSETS_URL)
+          rows=assets.get("assets",[])
+          if not isinstance(rows,list) or not rows:
+              raise RuntimeError("empty/malformed Robinhood asset catalog")
+
+          chain_assets=[]
+          symbols=set()
+          for a in rows:
+              if not isinstance(a,dict): continue
+              for d in a.get("deployments",[]) or []:
+                  try: cid=int(d.get("chainId",0))
+                  except: cid=0
+                  if cid==4663:
+                      ca=d.get("contractAddress","")
+                      if not address_re.match(ca):
+                          raise RuntimeError("malformed chain-4663 contract address")
+              if a.get("status")=="ASSET_STATUS_ACTIVE" and any(int(d.get("chainId",0))==4663 for d in a.get("deployments",[]) or []):
+                  sym=a.get("tokenSymbol")
+                  if sym:
+                      if sym in symbols: raise RuntimeError("duplicate active token symbol: "+sym)
+                      symbols.add(sym);chain_assets.append(a)
+
+          pathlib.Path("data/robinhood-assets.json").write_text(
+              json.dumps({"generatedAt":now,"assets":rows},indent=2)
+          )
+
+          def price(sym):
+              try:
+                  d=get(PRICE_BASE+urllib.parse.quote(sym),12,1_000_000)
+                  q=next((x for x in d.get("quotes",[]) if x.get("tokenSymbol")==sym),None)
+                  return sym,q
+              except Exception:
+                  return sym,None
+
+          quotes={}
+          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+              for sym,q in ex.map(price,sorted(symbols)):
+                  if q: quotes[sym]=q
+          if not quotes:
+              raise RuntimeError("no Robinhood price snapshots produced")
+
+          pathlib.Path("data/robinhood-prices.json").write_text(
+              json.dumps({"generatedAt":now,"quotesBySymbol":quotes},indent=2)
+          )
+
+          by={}
+          for addr in ADDRS:
+              if not address_re.match(addr): raise RuntimeError("bad configured account address")
+              try:
+                  items=get(BS.format(addr),15,5_000_000).get("items",[])
+                  by[addr.lower()]=items if isinstance(items,list) else []
+              except Exception:
+                  by[addr.lower()]=[]
+
+          pathlib.Path("data/rustee-history.json").write_text(
+              json.dumps({"generatedAt":now,"byAddress":by},indent=2)
+          )
+
+          print("active chain-4663 assets",len(chain_assets))
+          print("price snapshots",len(quotes))
+          print("history addresses",len(by))
+          PY
+
+      - name: Validate snapshot structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json, pathlib
+          a=json.load(open("data/robinhood-assets.json"))
+          p=json.load(open("data/robinhood-prices.json"))
+          h=json.load(open("data/rustee-history.json"))
+          assert isinstance(a["assets"],list) and len(a["assets"])>0
+          assert isinstance(p["quotesBySymbol"],dict) and len(p["quotesBySymbol"])>0
+          assert isinstance(h["byAddress"],dict) and len(h["byAddress"])==5
+          for f in ["data/robinhood-assets.json","data/robinhood-prices.json","data/rustee-history.json"]:
+              assert pathlib.Path(f).stat().st_size < 8_000_000
+          print("PASS: snapshot validation")
+          PY
+
+      - name: Generate integrity manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import hashlib, json, pathlib, datetime
+          files=[
+            "index.html",
+            "data/robinhood-assets.json",
+            "data/robinhood-prices.json",
+            "data/rustee-history.json",
+          ]
+          manifest={
+            "generatedAt":datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "algorithm":"SHA-256",
+            "sha256":{}
+          }
+          for f in files:
+              manifest["sha256"][f]=hashlib.sha256(pathlib.Path(f).read_bytes()).hexdigest()
+          pathlib.Path("data/integrity.json").write_text(json.dumps(manifest,indent=2))
+          print(json.dumps(manifest,indent=2))
+          PY
+
+      - name: Upload hardened Pages artifact
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: .
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
