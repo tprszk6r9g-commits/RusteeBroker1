@@ -1,0 +1,168 @@
+name: Deploy Rustee Metadata Installer
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: rustee-metadata-installer-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Never fails. Prints what is actually in the repo so a failure below
+      # can be diagnosed from the log instead of guessed at.
+      - name: Inventory repository
+        shell: bash
+        run: |
+          find . -path ./.git -prune -o -type f -print | sort
+
+      # Reports every token individually instead of aborting on the first
+      # miss, so a failure names the thing that is wrong.
+      - name: Verify metadata installer
+        shell: bash
+        run: |
+          set -uo pipefail
+          test -s index.html
+          fail=0
+          check() {
+            if grep -qF "$1" index.html; then
+              echo "PASS  $1"
+            else
+              echo "FAIL  $1"
+              fail=1
+            fi
+          }
+          check "On-Chain Metadata Installer"
+          check "0x4523467C4DDC6D775C7EaD4Dce7656DCe54e7F60"
+          check "SEL_SET_TOKEN_URI='e0df5b6f'"
+          check "SEL_METADATA_FROZEN='fb3cc6c2'"
+          check "SEL_FREEZE='d111515d'"
+          check 'id="TOKEN_URI"'
+          exit $fail
+
+      - name: Static frontend hardening checks
+        shell: bash
+        run: |
+          set -uo pipefail
+          fail=0
+          neg() {
+            if grep -Eiq "$1" index.html; then
+              echo "FAIL  $2"
+              fail=1
+            else
+              echo "PASS  $2"
+            fi
+          }
+          neg '<script[^>]+src='                          "no external script src"
+          neg ' on(click|error|load|mouseover|focus)='     "no inline event handlers"
+          neg '\beval\s*\(|new Function\s*\('             "no eval / new Function"
+          exit $fail
+
+      # Guards against a truncated or mangled payload. Tolerates a trailing
+      # newline, which GitHub's web editor appends to any file created
+      # through the browser.
+      - name: Verify embedded tokenURI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import re, sys, pathlib, json, base64
+          html = pathlib.Path("index.html").read_text()
+          m = re.search(r'id="TOKEN_URI" type="text/plain">(.*?)</script>', html, re.S)
+          if not m:
+              sys.exit("FAIL: TOKEN_URI script block not found")
+          embedded = m.group(1)
+          if not embedded.startswith("data:application/json"):
+              sys.exit("FAIL: embedded TOKEN_URI is not a data URI")
+
+          meta = json.loads(embedded.split(",", 1)[1])
+          img = meta["image"]
+          if not img.startswith("data:image/"):
+              sys.exit("FAIL: metadata image is not an inline data URI")
+          raw = base64.b64decode(img.split("base64,", 1)[1])
+          print(f"PASS: tokenURI {len(embedded):,} chars, "
+                f"embedded image {len(raw):,} bytes")
+
+          asset = pathlib.Path("assets/tokenURI_utf8.txt")
+          if not asset.exists():
+              print("WARN: assets/tokenURI_utf8.txt absent - equality check skipped")
+              sys.exit(0)
+          source = asset.read_text().rstrip("\r\n")
+          if embedded.rstrip("\r\n") != source:
+              sys.exit(f"FAIL: embedded tokenURI ({len(embedded)} chars) differs "
+                       f"from assets/tokenURI_utf8.txt ({len(source)} chars)")
+          print("PASS: embedded tokenURI matches assets/tokenURI_utf8.txt")
+          PY
+
+      # Matches assignment patterns and raw key material only. Matching the
+      # words "seed phrase" would fire on the installer's own copy stating a
+      # seed phrase is never requested - the same self-scan false positive
+      # that failed v4.9.3.2.
+      - name: Verify no secrets present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -rniE "(private[_-]?key|mnemonic|secret)[\"' ]*[:=][\"' ]*[^\"' ]|0x[0-9a-fA-F]{64}\b" \
+             index.html tools/ 2>/dev/null; then
+            echo "FAIL: possible secret material found"
+            exit 1
+          fi
+          echo "PASS: no key material detected"
+
+      - name: Generate integrity manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import hashlib, json, pathlib, datetime
+          files = ["index.html", "assets/tokenURI_utf8.txt"]
+          manifest = {
+            "generatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "algorithm": "SHA-256",
+            "sha256": {}
+          }
+          for f in files:
+              p = pathlib.Path(f)
+              if p.exists():
+                  manifest["sha256"][f] = hashlib.sha256(p.read_bytes()).hexdigest()
+          pathlib.Path("integrity.json").write_text(json.dumps(manifest, indent=2))
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Assemble site
+        shell: bash
+        run: |
+          set -euo pipefail
+          touch .nojekyll
+          test -f index.html
+          echo "PASS: index.html present at root"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: .
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
