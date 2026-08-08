@@ -1,0 +1,167 @@
+name: Deploy Rustee Metadata Installer
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: rustee-metadata-installer-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Never fails. Prints what is actually in the repo so a failure below
+      # can be diagnosed from the log instead of guessed at.
+      - name: Inventory repository
+        shell: bash
+        run: |
+          echo "=== tracked files ==="
+          git ls-files
+          echo
+          echo "=== all files (including dotfiles) ==="
+          find . -path ./.git -prune -o -type f -print | sort
+
+      # Locates index.html at the repo root, or in a single subdirectory
+      # (the usual result of uploading an extracted folder through the
+      # GitHub mobile web UI). Publishes from wherever it actually is.
+      - name: Resolve site root
+        id: siteroot
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f index.html ]; then
+            ROOT="."
+            echo "index.html found at repository root"
+          else
+            MATCHES=$(find . -path ./.git -prune -o -name index.html -print | sort)
+            COUNT=$(printf '%s' "$MATCHES" | grep -c . || true)
+            if [ "$COUNT" -eq 0 ]; then
+              echo "FAIL: no index.html anywhere in the repository."
+              echo "The installer must be committed as index.html."
+              echo "A file named Rustee_Metadata_Installer_v1.html will not"
+              echo "resolve at the bare Pages URL."
+              exit 1
+            elif [ "$COUNT" -gt 1 ]; then
+              echo "FAIL: multiple index.html files found:"
+              echo "$MATCHES"
+              echo "Keep exactly one."
+              exit 1
+            fi
+            ROOT=$(dirname "$MATCHES")
+            echo "index.html found in subdirectory: $ROOT"
+            echo "Publishing from there. Move it to the repo root to simplify."
+          fi
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+
+      - name: Verify installer integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="${{ steps.siteroot.outputs.root }}"
+          HTML="$ROOT/index.html"
+          fail=0
+          check() {
+            if grep -qF "$1" "$HTML"; then
+              echo "PASS: $2"
+            else
+              echo "FAIL: $2 - not found in $HTML"
+              fail=1
+            fi
+          }
+          check "0x4523467C4DDC6D775C7EaD4Dce7656DCe54e7F60" "contract address"
+          check "SEL_SET_TOKEN_URI='e0df5b6f'"               "setTokenURI selector"
+          check "SEL_METADATA_FROZEN='fb3cc6c2'"             "metadataFrozen selector"
+          check 'id="TOKEN_URI"'                            "TOKEN_URI script block"
+          exit $fail
+
+      # Guards against a truncated or mangled payload. Tolerates a trailing
+      # newline, which GitHub's web editor appends to any file created
+      # through the browser.
+      - name: Verify embedded tokenURI
+        shell: bash
+        env:
+          SITE_ROOT: ${{ steps.siteroot.outputs.root }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os, re, sys, pathlib
+          root = pathlib.Path(os.environ["SITE_ROOT"])
+          html = (root / "index.html").read_text()
+          m = re.search(r'id="TOKEN_URI" type="text/plain">(.*?)</script>', html, re.S)
+          if not m:
+              sys.exit("FAIL: TOKEN_URI script block not found")
+          embedded = m.group(1)
+          if not embedded.startswith("data:application/json"):
+              sys.exit("FAIL: embedded TOKEN_URI is not a data URI")
+          print(f"PASS: embedded tokenURI is a data URI, {len(embedded)} chars")
+
+          asset = root / "assets" / "tokenURI_utf8.txt"
+          if not asset.exists():
+              print("WARN: assets/tokenURI_utf8.txt not present - skipping "
+                    "equality check. The embedded payload is unverified "
+                    "against a source of truth.")
+              sys.exit(0)
+          source = asset.read_text().rstrip("\r\n")
+          if embedded.rstrip("\r\n") != source:
+              sys.exit(f"FAIL: embedded tokenURI ({len(embedded)} chars) "
+                       f"differs from assets/tokenURI_utf8.txt ({len(source)} chars)")
+          print("PASS: embedded tokenURI matches assets/tokenURI_utf8.txt")
+          PY
+
+      # Matches assignment patterns and raw key material only. An earlier
+      # version matched the words "seed phrase", which fired on the
+      # installer's own copy stating a seed phrase is never requested - the
+      # same self-scan false positive that failed v4.9.3.2.
+      - name: Verify no secrets present
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="${{ steps.siteroot.outputs.root }}"
+          if grep -rniE "(private[_-]?key|mnemonic|secret)[\"' ]*[:=][\"' ]*[^\"' ]|0x[0-9a-fA-F]{64}\b" \
+             "$ROOT/index.html" 2>/dev/null; then
+            echo "FAIL: possible secret material found"
+            exit 1
+          fi
+          echo "PASS: no key material detected"
+
+      # .nojekyll is created here rather than required in the repo. iOS and
+      # the GitHub web uploader both hide dotfiles, so committing one from a
+      # phone is unreliable - and there is no reason to fail a deploy over a
+      # zero-byte marker the workflow can write itself.
+      - name: Assemble site
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="${{ steps.siteroot.outputs.root }}"
+          rm -rf /tmp/_site
+          mkdir -p /tmp/_site
+          tar -C "$ROOT" --exclude=./.git --exclude=./.github -cf - . \
+            | tar -C /tmp/_site -xf -
+          touch /tmp/_site/.nojekyll
+          rm -rf _site
+          mv /tmp/_site _site
+          echo "=== published tree ==="
+          find _site -type f | sort
+          test -f _site/index.html
+          echo "PASS: _site/index.html present"
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
